@@ -5,8 +5,8 @@ from flask import Flask, flash, render_template, request, redirect, url_for, ses
 from werkzeug.utils import secure_filename
 from datetime import timedelta, datetime
 
-# Import các hàm từ db.py
-from db import (
+# Import các hàm từ db_mongo.py (MongoDB)
+from db_mongo import (
     create_customer,
     get_customer_by_email,
     update_last_login,
@@ -17,9 +17,10 @@ from db import (
     get_admin_by_email_and_password,
     get_room_by_id,
     is_room_booked,
-    create_booking  # Hàm lưu thông tin đặt phòng (nếu cần)
+    create_booking
 )
-# Import hàm upload_file_to_drive (sử dụng trong add_room_with_image)
+
+# Giả sử bạn vẫn sử dụng hàm upload_file_to_drive từ drive_upload.py
 from drive_upload import upload_file_to_drive
 
 app = Flask(__name__)
@@ -51,14 +52,24 @@ def change_language(lang):
 def index():
     user_email = session.get('email')
     user_avatar = session.get('avatar', 'default.jpg')
-    rooms = get_all_rooms()
+    rooms = get_all_rooms()  # Lấy danh sách phòng từ MongoDB
+
+    # Các bộ lọc nếu bạn có sử dụng
     popular = session.get('popular')
     tiennghi = session.get('tiennghi')
     xephang = session.get('xephang')
     rating = session.get('rating')
-    return render_template('index.html', user_email=user_email, user_avatar=user_avatar,
-                           rooms=rooms, filter_popular=popular, filter_tiennghi=tiennghi,
-                           filter_xephang=xephang, filter_rating=rating)
+
+    return render_template(
+        'index.html',
+        user_email=user_email,
+        user_avatar=user_avatar,
+        rooms=rooms,
+        filter_popular=popular,
+        filter_tiennghi=tiennghi,
+        filter_xephang=xephang,
+        filter_rating=rating
+    )
 
 # -------------------------------
 # ROUTE: Tìm kiếm
@@ -70,6 +81,7 @@ def search():
     checkout = request.args.get('checkout')
     guests = request.args.get('guests')
     print("Search data:", destination, checkin, checkout, guests)
+    # Tuỳ ý render lại trang index hoặc trang kết quả tìm kiếm
     return render_template('index.html')
 
 # -------------------------------
@@ -89,25 +101,31 @@ def login():
         else:
             email = request.form.get('email')
             password = request.form.get('password')
-            
+        
         user = get_customer_by_email(email)
         if user:
-            if user['MatKhau'] == password:
+            # Mật khẩu lưu trong trường 'password'
+            if user.get('password') == password:
                 session.permanent = True
-                session['user_id'] = user['MaKH']
-                session['email'] = user['Email']
-                update_last_login(user['MaKH'])
+                # Lưu một số thông tin vào session
+                session['user_id'] = str(user.get('_id'))  # ID của MongoDB
+                session['email'] = user.get('Email')
+                # Cập nhật last_login dựa trên Email
+                update_last_login(user.get('Email'))
+
                 if request.is_json:
                     return jsonify({"success": True, "message": "Đăng nhập thành công"})
                 else:
                     return redirect(url_for('index'))
             else:
+                # Sai mật khẩu
                 if request.is_json:
                     return jsonify({"success": False, "message": "Mật khẩu không chính xác"})
                 else:
                     flash("Mật khẩu không chính xác", "error")
                     return redirect(url_for('auth_bp.login'))
         else:
+            # Không tìm thấy user
             if request.is_json:
                 return jsonify({"success": False, "message": "Không tìm thấy tài khoản với email này"})
             else:
@@ -124,6 +142,7 @@ def register():
     if request.method == 'GET':
         return render_template('register.html')
     else:
+        # Lấy dữ liệu từ form
         ho_ten = request.form.get('ho_ten')
         email = request.form.get('email')
         password = request.form.get('password')
@@ -131,11 +150,23 @@ def register():
         dia_chi = request.form.get('dia_chi')
         cmnd = request.form.get('cmnd')
         
+        # Kiểm tra email đã tồn tại chưa
         if get_customer_by_email(email):
             flash("Email đã được sử dụng, vui lòng sử dụng email khác.", "error")
             return redirect(url_for('auth_bp.register'))
         
-        user_id = create_customer(ho_ten, email, password, phone, dia_chi, cmnd)
+        # Tạo document khách hàng
+        customer_data = {
+            'HoTen': ho_ten,
+            'Email': email,
+            'password': password,  # Khuyến cáo: nên mã hoá mật khẩu
+            'DienThoai': phone,
+            'DiaChi': dia_chi,
+            'CMND': cmnd,
+            'last_login': None,
+            'avatar': None
+        }
+        user_id = create_customer(customer_data)
         if user_id:
             flash("Đăng ký thành công! Vui lòng đăng nhập.", "success")
             return redirect(url_for('auth_bp.login'))
@@ -145,28 +176,40 @@ def register():
 
 @auth_bp.route('/update_avatar', methods=['GET', 'POST'])
 def update_avatar():
-    if 'user_id' not in session:
+    if 'user_id' not in session or 'email' not in session:
         flash("Bạn cần đăng nhập để thay đổi avatar.", "error")
         return redirect(url_for('auth_bp.login'))
+    
     if request.method == 'GET':
         return render_template('update_avatar.html')
     else:
         if 'avatar' not in request.files:
             flash("Không tìm thấy file tải lên.", "error")
             return redirect(request.url)
+        
         file = request.files['avatar']
         if file.filename == '':
             flash("Bạn chưa chọn file.", "error")
             return redirect(request.url)
+        
         if file and allowed_file(file.filename):
             filename = secure_filename(file.filename)
+            # Đặt tên file có kèm ID user để tránh trùng
             filename = f"user_{session['user_id']}_{filename}"
             file_path = os.path.join(app.config['UPLOAD_FOLDER'], filename)
+
+            # Tạo thư mục nếu chưa tồn tại
             if not os.path.exists(app.config['UPLOAD_FOLDER']):
                 os.makedirs(app.config['UPLOAD_FOLDER'])
+
+            # Lưu file vào thư mục avatars
             file.save(file_path)
-            update_user_avatar(session['user_id'], filename)
+
+            # Cập nhật avatar trong DB
+            update_user_avatar(session['email'], filename)
+            # Cập nhật avatar trong session
             session['avatar'] = filename
+
             flash("Avatar cập nhật thành công!", "success")
             return redirect(url_for('index'))
         else:
@@ -187,8 +230,8 @@ def admin_login():
         password = request.form.get('password')
         admin = get_admin_by_email_and_password(email, password)
         if admin:
-            session['admin_id'] = admin['MaNV']
-            session['admin_email'] = admin['Email']
+            session['admin_id'] = str(admin.get('_id'))
+            session['admin_email'] = admin.get('Email')
             return redirect(url_for('admin_dashboard'))
         else:
             error = "Sai thông tin đăng nhập. Vui lòng kiểm tra lại."
@@ -201,12 +244,18 @@ def admin_dashboard():
 @app.route('/admin/add_room_type', methods=['GET', 'POST'])
 def add_room_type_route():
     if request.method == 'GET':
-        return render_template('add_room_type.html')
+        room_types = get_all_room_types()
+        return render_template('add_room_type.html', room_types=room_types)
     else:
         ten_loai = request.form.get('ten_loai')
         gia_phong = request.form.get('gia_phong')
         mota = request.form.get('mota')
-        result = add_room_type(ten_loai, gia_phong, mota)
+        room_type_data = {
+            'name': ten_loai,
+            'price': float(gia_phong),
+            'description': mota
+        }
+        result = add_room_type(room_type_data)
         if result:
             flash("Thêm loại phòng thành công!", "success")
             return redirect(url_for('add_room_type_route'))
@@ -233,34 +282,33 @@ def add_room():
             os.makedirs(temp_folder)
         temp_path = os.path.join(temp_folder, filename)
         file.save(temp_path)
-        from db import add_room_with_image  # Đảm bảo hàm này hoạt động
+
+        # Hàm add_room_with_image xử lý cả tạo phòng lẫn upload ảnh
+        from db_mongo import add_room_with_image
         add_room_with_image(temp_path, f"room_{filename}", so_phong, ma_loai_phong, mo_ta, "", trang_thai)
         os.remove(temp_path)
     else:
-        from db import add_room_to_db
+        from db_mongo import add_room_to_db
         add_room_to_db(so_phong, ma_loai_phong, mo_ta, trang_thai)
     
     flash("Thêm phòng thành công!", "success")
     return redirect(url_for('add_room'))
 
 # -------------------------------
-# ROUTE: Đặt phòng (Booking) và tích hợp Thanh toán
+# ROUTE: Đặt phòng (Booking) & Thanh toán
 # -------------------------------
 @app.route('/booking/<int:room_id>', methods=['GET', 'POST'])
 def booking(room_id):
     if request.method == 'GET':
-        # Lấy checkin, checkout từ query string (nếu có)
         checkin_str = request.args.get('checkin')
         checkout_str = request.args.get('checkout')
-
         room = get_room_by_id(room_id)
         if not room:
             flash("Không tìm thấy phòng", "error")
             return redirect(url_for('index'))
 
-        # Tính số đêm và tổng tiền (nếu checkin và checkout được truyền vào)
         so_dem = 1
-        tong_gia = room['GiaPhong'] if room['GiaPhong'] else 0
+        tong_gia = room.get('price', 0)
         if checkin_str and checkout_str:
             try:
                 checkin_date = datetime.strptime(checkin_str, "%Y-%m-%d").date()
@@ -268,7 +316,7 @@ def booking(room_id):
                 so_dem = (checkout_date - checkin_date).days
                 if so_dem < 1:
                     so_dem = 1
-                tong_gia = so_dem * (room['GiaPhong'] if room['GiaPhong'] else 0)
+                tong_gia = so_dem * room.get('price', 0)
             except Exception as e:
                 print("Error parsing dates:", e)
         
@@ -281,7 +329,7 @@ def booking(room_id):
             tong_gia=tong_gia
         )
     else:
-        # Xử lý khi submit form đặt phòng
+        # Xử lý form đặt phòng
         first_name = request.form.get('firstName')
         last_name = request.form.get('lastName')
         email = request.form.get('email')
@@ -292,42 +340,48 @@ def booking(room_id):
         region_code = request.form.get('regionCode')
         phone = request.form.get('phone')
 
-        # Lưu thông tin đặt phòng vào database (nếu cần)
-        # booking_id = create_booking(...)
-
-        # Giả sử tổng tiền thanh toán được tính toán từ GET hoặc tính lại ở đây
-        # Ở demo này, ta sử dụng một giá trị mặc định (1000000 VND)
+        # Tạo booking_data dạng dict
+        booking_data = {
+            'customer_first_name': first_name,
+            'customer_last_name': last_name,
+            'email': email,
+            'country': country,
+            'address': address,
+            'city': city,
+            'postal_code': postal_code,
+            'region_code': region_code,
+            'phone': phone,
+            # Thiếu room_id, checkin_date, checkout_date, ...
+            # Bạn cần thêm tuỳ logic của mình
+        }
+        # Giả sử tính tổng tiền là 1,000,000
         tong_gia = 1000000
 
-        # Sau khi lưu thông tin, chuyển hướng người dùng sang trang thanh toán
+        # Lưu booking vào MongoDB
+        create_booking(booking_data)
         return redirect(url_for('create_payment', amount=tong_gia))
 
 # -------------------------------
-# ROUTE: Tích hợp Thanh toán qua VNPay
+# ROUTE: Tích hợp Thanh toán VNPay
 # -------------------------------
 @app.route('/create_payment')
 def create_payment():
-    # Lấy số tiền từ query parameter (mặc định 1000000 nếu không có)
     amount = request.args.get('amount', default=1000000, type=int)
-    # Các thông số cần thiết theo yêu cầu của VNPay
     vnp_Version = "2.1.0"
     vnp_Command = "pay"
     vnp_TmnCode = "YOUR_TMN_CODE"  # Thay bằng TmnCode của bạn
-    # VNPay yêu cầu số tiền được nhân với 100 (VD: 1,000,000 VND -> 100000000)
     vnp_Amount = str(amount * 100)
     vnp_CurrCode = "VND"
-    vnp_TxnRef = "ORDER" + datetime.now().strftime("%H%M%S")  # Mã đơn hàng duy nhất
+    vnp_TxnRef = "ORDER" + datetime.now().strftime("%H%M%S")
     vnp_OrderInfo = "Thanh toán đặt phòng khách sạn"
     vnp_OrderType = "other"
-    vnp_Locale = "vn"               # Ngôn ngữ (vn/en)
-    vnp_SecureHashType = "SHA256"   # Khai báo phương thức mã hóa
-    # URL callback sau khi thanh toán (phải là URL công khai khi triển khai)
+    vnp_Locale = "vn"
+    vnp_SecureHashType = "SHA256"
     vnp_ReturnUrl = url_for('vnpay_return', _external=True)
     vnp_CreateDate = datetime.now().strftime("%Y%m%d%H%M%S")
     vnp_IpAddr = request.remote_addr
-    secret_key = "YOUR_SECRET_KEY"  # Thay bằng secret key của bạn từ VNPay
+    secret_key = "YOUR_SECRET_KEY"  # Thay bằng secret key của bạn
 
-    # Tạo dictionary chứa các tham số
     vnp_params = {
         "vnp_Version": vnp_Version,
         "vnp_Command": vnp_Command,
@@ -344,62 +398,43 @@ def create_payment():
         "vnp_SecureHashType": vnp_SecureHashType
     }
 
-    # Sắp xếp các tham số theo thứ tự bảng chữ cái
     sorted_vnp_params = sorted(vnp_params.items())
-    # Tạo query string
     query_string = urllib.parse.urlencode(sorted_vnp_params)
-    # Tạo chuỗi dữ liệu để ký
     sign_data = '&'.join(["{}={}".format(k, v) for k, v in sorted_vnp_params])
-    # Tạo chữ ký số (hash) bằng SHA256
     secure_hash = hashlib.sha256((secret_key + sign_data).encode('utf-8')).hexdigest()
 
-    # Tạo URL thanh toán
     payment_url = (
         "https://sandbox.vnpayment.vn/paymentv2/vpcpay.html?"
         + query_string
-        + "&vnp_SecureHash="
-        + secure_hash
+        + "&vnp_SecureHash=" + secure_hash
     )
 
-    # In ra URL (debug) để kiểm tra nếu cần
     print("Payment URL:", payment_url)
-
-    # Chuyển hướng khách hàng đến trang thanh toán của VNPay
     return redirect(payment_url)
 
 @app.route('/vnpay_return')
 def vnpay_return():
     data = request.args.to_dict()
     print("VNPay callback data:", data)
-
-    # 1. Kiểm tra chữ ký (SecureHash) trả về có trùng khớp không
-    #    - Lấy vnp_SecureHash và vnp_SecureHashType từ data
     received_hash = data.pop('vnp_SecureHash', None)
     received_hash_type = data.pop('vnp_SecureHashType', None)
-    
-    # 2. Tạo lại sign_data từ các tham số còn lại
+
     sorted_data = sorted(data.items())
     sign_data = '&'.join(["{}={}".format(k, v) for k, v in sorted_data])
 
-    # 3. Tạo lại mã băm để so sánh
-    secret_key = "*bzwzl9d&aq)rg2z9(@twit_)=5fp77et3i&l4-xp1h$r)^+gp"  # Giống với secret key ở trên
+    # Secret key mẫu, bạn thay bằng key thực tế
+    secret_key = "*bzwzl9d&aq)rg2z9(@twit_)=5fp77et3i&l4-xp1h$r)^+gp"
     my_hash = hashlib.sha256((secret_key + sign_data).encode('utf-8')).hexdigest()
 
-    if my_hash.upper() == received_hash.upper():
-        # Hash trùng khớp => giao dịch hợp lệ
-        # Kiểm tra tiếp vnp_ResponseCode để biết thanh toán thành công hay thất bại
+    if my_hash.upper() == (received_hash or "").upper():
         response_code = data.get('vnp_ResponseCode', '99')
         if response_code == '00':
-            # Thanh toán thành công
-            # TODO: Cập nhật trạng thái đơn hàng trong DB
             flash("Thanh toán thành công!", "success")
             return redirect(url_for('index'))
         else:
-            # Thanh toán không thành công
             flash(f"Thanh toán thất bại. Mã lỗi: {response_code}", "error")
             return redirect(url_for('index'))
     else:
-        # Sai chữ ký => có thể là giả mạo
         flash("Chữ ký không hợp lệ, giao dịch bị từ chối!", "error")
         return redirect(url_for('index'))
 
